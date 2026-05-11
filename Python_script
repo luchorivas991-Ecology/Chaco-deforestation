@@ -1,0 +1,441 @@
+from qgis.core import (
+    QgsProject,
+    QgsField,
+    QgsDistanceArea,
+    QgsCoordinateReferenceSystem,
+    QgsPointXY
+)
+from qgis.PyQt.QtCore import QVariant
+import processing
+import math
+
+# ============================================================
+# Correct loaded QGIS layer names
+# ============================================================
+
+department_layer_name = "santiago_departamentos_deforestation_aoi — departamentopolygon"
+
+raster_1994_layer_name = "1994_coverage_lclu_2-4-1_ef7ed30e-8643-4a28-bcff-7431580de12a"
+
+raster_2023_layer_name = "2023_coverage_lclu_2-4-1_0b5635fc-4a8c-4c60-9702-74e1d06dda5e"
+
+# Forest / trees class value in the LCLU raster
+forest_class_value = 3 
+
+years = 2023 - 1994
+
+prefix_1994 = "f94_"
+prefix_2023 = "f23_"
+
+temp_id_field = "_origfid"
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def get_layer_by_name(layer_name):
+    layers = QgsProject.instance().mapLayersByName(layer_name)
+    if not layers:
+        raise Exception(f"Layer not found: {layer_name}")
+    return layers[0]
+
+
+def add_field_if_missing(layer, field_name, field_type=QVariant.Double):
+    if field_name not in layer.fields().names():
+        layer.dataProvider().addAttributes([QgsField(field_name, field_type)])
+        layer.updateFields()
+
+
+def delete_field_if_exists(layer, field_name):
+    idx = layer.fields().indexFromName(field_name)
+    if idx != -1:
+        layer.dataProvider().deleteAttributes([idx])
+        layer.updateFields()
+
+
+def safe_number(value):
+    if value is None or value == NULL:
+        return 0.0
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def safe_loss_pct(loss_ha, forest_1994_ha):
+    if forest_1994_ha <= 0:
+        return None
+    return 100.0 * loss_ha / forest_1994_ha
+
+
+def safe_compound_rate(forest_1994_ha, forest_2023_ha, years):
+    """
+    Compound annual deforestation rate as percent per year.
+
+    Formula:
+        100 * [1 - (forest_2023 / forest_1994) ** (1 / years)]
+    """
+    if forest_1994_ha <= 0:
+        return None
+
+    if forest_2023_ha <= 0:
+        return 100.0
+
+    return 100.0 * (1.0 - ((forest_2023_ha / forest_1994_ha) ** (1.0 / years)))
+
+
+def find_histogram_field(layer, prefix, raster_value):
+    """
+    Finds the field created by native:zonalhistogram for the target raster class.
+
+    Usually QGIS creates:
+        f94_1
+        f23_1
+    """
+    field_names = layer.fields().names()
+
+    candidates = [
+        f"{prefix}{raster_value}",
+        f"{prefix}{float(raster_value)}",
+        f"{prefix}{raster_value}.0",
+        f"{prefix}{raster_value}_0"
+    ]
+
+    for candidate in candidates:
+        if candidate in field_names:
+            return candidate
+
+    for field_name in field_names:
+        if not field_name.startswith(prefix):
+            continue
+
+        suffix = field_name.replace(prefix, "")
+        suffix_clean = suffix.replace(".0", "").replace("_0", "")
+
+        if suffix_clean == str(raster_value):
+            return field_name
+
+    raise Exception(
+        f"Could not find histogram field for raster value {raster_value} "
+        f"with prefix '{prefix}'. Available fields:\n{field_names}"
+    )
+
+
+def format_nullable_number(value, decimals=2):
+    if value is None:
+        return "NA"
+    return f"{value:,.{decimals}f}"
+
+
+def pixel_area_ha_for_feature(feature, raster_layer):
+    """
+    Returns approximate raster pixel area in hectares at the feature centroid.
+
+    This handles EPSG:4326 rasters better than simply multiplying degrees.
+    For geographic rasters, it computes geodesic area of one raster pixel
+    at the feature centroid latitude.
+    """
+    pixel_width = abs(raster_layer.rasterUnitsPerPixelX())
+    pixel_height = abs(raster_layer.rasterUnitsPerPixelY())
+
+    raster_crs = raster_layer.crs()
+
+    if not raster_crs.isGeographic():
+        return pixel_width * pixel_height / 10000.0
+
+    centroid = feature.geometry().centroid().asPoint()
+    lon = centroid.x()
+    lat = centroid.y()
+
+    half_w = pixel_width / 2.0
+    half_h = pixel_height / 2.0
+
+    ring = [
+        QgsPointXY(lon - half_w, lat - half_h),
+        QgsPointXY(lon + half_w, lat - half_h),
+        QgsPointXY(lon + half_w, lat + half_h),
+        QgsPointXY(lon - half_w, lat + half_h),
+        QgsPointXY(lon - half_w, lat - half_h)
+    ]
+
+    d = QgsDistanceArea()
+    d.setSourceCrs(QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance().transformContext())
+    d.setEllipsoid("WGS84")
+
+    area_m2 = abs(d.measurePolygon(ring))
+
+    return area_m2 / 10000.0
+
+
+# ============================================================
+# Load layers
+# ============================================================
+
+department_layer = get_layer_by_name(department_layer_name)
+raster_1994_layer = get_layer_by_name(raster_1994_layer_name)
+raster_2023_layer = get_layer_by_name(raster_2023_layer_name)
+
+if not department_layer.isValid():
+    raise Exception(f"Invalid department layer: {department_layer_name}")
+
+if not raster_1994_layer.isValid():
+    raise Exception(f"Invalid 1994 raster layer: {raster_1994_layer_name}")
+
+if not raster_2023_layer.isValid():
+    raise Exception(f"Invalid 2023 raster layer: {raster_2023_layer_name}")
+
+print("Department layer:", department_layer.name())
+print("1994 raster:", raster_1994_layer.name())
+print("2023 raster:", raster_2023_layer.name())
+print("Forest class value:", forest_class_value)
+
+print("")
+print("Raster 1994 CRS:", raster_1994_layer.crs().authid())
+print("Raster 2023 CRS:", raster_2023_layer.crs().authid())
+print("Raster pixel size 1994:", raster_1994_layer.rasterUnitsPerPixelX(), raster_1994_layer.rasterUnitsPerPixelY())
+print("")
+
+
+# ============================================================
+# Add temporary original feature id field
+# ============================================================
+
+add_field_if_missing(department_layer, temp_id_field, QVariant.LongLong)
+
+temp_id_idx = department_layer.fields().indexFromName(temp_id_field)
+
+department_layer.startEditing()
+
+for feature in department_layer.getFeatures():
+    department_layer.changeAttributeValue(
+        feature.id(),
+        temp_id_idx,
+        int(feature.id())
+    )
+
+department_layer.commitChanges()
+
+
+# ============================================================
+# Run zonal histogram for 1994 original LCLU raster
+# ============================================================
+
+print("Running native:zonalhistogram for 1994 raster...")
+
+zonal_1994 = processing.run(
+    "native:zonalhistogram",
+    {
+        "INPUT_VECTOR": department_layer,
+        "INPUT_RASTER": raster_1994_layer,
+        "RASTER_BAND": 1,
+        "COLUMN_PREFIX": prefix_1994,
+        "OUTPUT": "memory:departments_zonalhist_1994"
+    }
+)["OUTPUT"]
+
+
+# ============================================================
+# Run zonal histogram for 2023 original LCLU raster
+# ============================================================
+
+print("Running native:zonalhistogram for 2023 raster...")
+
+zonal_both = processing.run(
+    "native:zonalhistogram",
+    {
+        "INPUT_VECTOR": zonal_1994,
+        "INPUT_RASTER": raster_2023_layer,
+        "RASTER_BAND": 1,
+        "COLUMN_PREFIX": prefix_2023,
+        "OUTPUT": "memory:departments_zonalhist_1994_2023"
+    }
+)["OUTPUT"]
+
+
+# ============================================================
+# Locate histogram count fields for forest class value
+# ============================================================
+
+forest_1994_count_field = find_histogram_field(
+    zonal_both,
+    prefix_1994,
+    forest_class_value
+)
+
+forest_2023_count_field = find_histogram_field(
+    zonal_both,
+    prefix_2023,
+    forest_class_value
+)
+
+print("1994 forest pixel count field:", forest_1994_count_field)
+print("2023 forest pixel count field:", forest_2023_count_field)
+
+
+# ============================================================
+# Add output fields to original department layer
+# ============================================================
+
+output_fields = [
+    "forest94ha",
+    "forest23ha",
+    "loss_ha",
+    "loss_pct",
+    "ann_loss",
+    "comp_rate"
+]
+
+for field_name in output_fields:
+    add_field_if_missing(department_layer, field_name, QVariant.Double)
+
+department_layer.updateFields()
+
+field_indices = {
+    field_name: department_layer.fields().indexFromName(field_name)
+    for field_name in output_fields
+}
+
+
+# ============================================================
+# Build results from zonal histogram output
+# ============================================================
+
+results_by_origfid = {}
+
+for feature in zonal_both.getFeatures():
+    orig_fid = int(feature[temp_id_field])
+
+    forest_1994_pixels = safe_number(feature[forest_1994_count_field])
+    forest_2023_pixels = safe_number(feature[forest_2023_count_field])
+
+    pixel_area_ha = pixel_area_ha_for_feature(feature, raster_1994_layer)
+
+    forest_1994_ha = forest_1994_pixels * pixel_area_ha
+    forest_2023_ha = forest_2023_pixels * pixel_area_ha
+
+    loss_ha = forest_1994_ha - forest_2023_ha
+    loss_pct = safe_loss_pct(loss_ha, forest_1994_ha)
+    ann_loss = loss_ha / years
+    comp_rate = safe_compound_rate(forest_1994_ha, forest_2023_ha, years)
+
+    results_by_origfid[orig_fid] = {
+        "forest_1994_pixels": forest_1994_pixels,
+        "forest_2023_pixels": forest_2023_pixels,
+        "pixel_area_ha": pixel_area_ha,
+        "forest94ha": forest_1994_ha,
+        "forest23ha": forest_2023_ha,
+        "loss_ha": loss_ha,
+        "loss_pct": loss_pct,
+        "ann_loss": ann_loss,
+        "comp_rate": comp_rate
+    }
+
+
+# ============================================================
+# Write calculated fields back to original department layer
+# ============================================================
+
+print("Writing deforestation fields to original department layer...")
+
+department_layer.startEditing()
+
+for feature in department_layer.getFeatures():
+    orig_fid = int(feature.id())
+
+    if orig_fid not in results_by_origfid:
+        continue
+
+    row = results_by_origfid[orig_fid]
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["forest94ha"],
+        row["forest94ha"]
+    )
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["forest23ha"],
+        row["forest23ha"]
+    )
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["loss_ha"],
+        row["loss_ha"]
+    )
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["loss_pct"],
+        row["loss_pct"]
+    )
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["ann_loss"],
+        row["ann_loss"]
+    )
+
+    department_layer.changeAttributeValue(
+        feature.id(),
+        field_indices["comp_rate"],
+        row["comp_rate"]
+    )
+
+department_layer.commitChanges()
+department_layer.triggerRepaint()
+
+
+# ============================================================
+# Remove temporary original feature id field
+# ============================================================
+
+delete_field_if_exists(department_layer, temp_id_field)
+
+
+# ============================================================
+# Print summary table
+# ============================================================
+
+print("")
+print("Deforestation summary by department")
+print("-" * 155)
+
+header = (
+    f"{'FID':>6s} "
+    f"{'Forest px 1994':>15s} "
+    f"{'Forest px 2023':>15s} "
+    f"{'Pixel ha':>12s} "
+    f"{'Forest 1994 ha':>16s} "
+    f"{'Forest 2023 ha':>16s} "
+    f"{'Loss ha':>16s} "
+    f"{'Loss %':>10s} "
+    f"{'Annual ha/yr':>16s} "
+    f"{'Comp %/yr':>12s}"
+)
+
+print(header)
+print("-" * 155)
+
+for orig_fid in sorted(results_by_origfid.keys()):
+    row = results_by_origfid[orig_fid]
+
+    print(
+        f"{orig_fid:6d} "
+        f"{row['forest_1994_pixels']:15,.0f} "
+        f"{row['forest_2023_pixels']:15,.0f} "
+        f"{row['pixel_area_ha']:12,.6f} "
+        f"{row['forest94ha']:16,.2f} "
+        f"{row['forest23ha']:16,.2f} "
+        f"{row['loss_ha']:16,.2f} "
+        f"{format_nullable_number(row['loss_pct']):>10s} "
+        f"{row['ann_loss']:16,.2f} "
+        f"{format_nullable_number(row['comp_rate']):>12s}"
+    )
+
+print("-" * 155)
+print("Finished.")
+print("Updated layer:", department_layer.name())
+print("Fields added/updated:", ", ".join(output_fields))
